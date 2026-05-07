@@ -158,6 +158,7 @@ class Trainer:
             "top_k": self.top_k,
             "prompt_param": [self.num_tasks, args.prompt_param],
             "pretrained_weight": args.pretrained_weight,
+            "log_dir": args.log_dir,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](

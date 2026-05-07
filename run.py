@@ -138,6 +138,12 @@ def create_args():
     parser.add_argument(
         "--pretrained_weight", type=str, default="sup1k", help="load pretrained weight"
     )
+    parser.add_argument(
+        "--max_task",
+        type=int,
+        default=-1,
+        help="max number of tasks to train (-1 = all). Overrides YAML config.",
+    )
 
     # Config Arg
     parser.add_argument(

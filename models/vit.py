@@ -101,9 +101,24 @@ class Attention(nn.Module):
         prompt_score_attn = None
         prompt_score_ = None
         prompt_score_label_ = None
+        routing_mode = None
+        route_rank = None
+        soft_alpha = None
+        soft_tau = None
+        soft_eps = None
+        self.last_q_prompt = None
 
         if prompt is not None:
-            if len(prompt) == 3:
+            if isinstance(prompt, dict):
+                pk = prompt["pk"]
+                pv = prompt["pv"]
+                prompt_length = pk.size(2)
+                routing_mode = prompt.get("routing_mode")
+                route_rank = int(prompt.get("route_rank", 1))
+                soft_alpha = float(prompt.get("soft_alpha", 1.0))
+                soft_tau = float(prompt.get("soft_tau", 1.0))
+                soft_eps = float(prompt.get("eps", 1e-6))
+            elif len(prompt) == 3:
                 pk, pv, eps_decay = prompt
                 prompt_length = pk.size(2)
             else:
@@ -122,20 +137,48 @@ class Attention(nn.Module):
                 q_prompt = q.mean(
                     dim=-2, keepdim=True
                 )  # (B, num_heads, 1, C // self.num_heads)
+                self.last_q_prompt = q_prompt.detach()
 
                 prompt_score_attn = q_prompt @ pk.transpose(
                     -2, -1
                 )  # (B, num_heads, 1, num_prompt)
                 prompt_score_ = prompt_score_attn
 
-                attn = torch.cat(
-                    [
-                        prompt_score_attn.expand(-1, -1, N, -1)
-                        * self.scale,  # (B, num_heads, N, num_prompt)
-                        (q @ k.transpose(-2, -1)) * self.scale,
-                    ],
-                    dim=-1,
-                )
+                if routing_mode == "soft_moe":
+                    kth = min(max(route_rank, 1), prompt_score_attn.size(-1))
+                    threshold = torch.topk(
+                        prompt_score_attn, kth, dim=-1
+                    ).values[..., -1:]
+                    tau = max(soft_tau, soft_eps)
+                    scaled = torch.clamp(
+                        -(prompt_score_attn - threshold) / tau, min=-60.0, max=60.0
+                    )
+                    sigma = 1.0 / (
+                        1.0
+                        + soft_alpha
+                        * torch.exp(scaled)
+                    )
+                    prompt_score_label_ = sigma
+                    prompt_logits = (
+                        prompt_score_attn * self.scale
+                        + torch.log(sigma + soft_eps)
+                    )
+                    attn = torch.cat(
+                        [
+                            prompt_logits.expand(-1, -1, N, -1),
+                            (q @ k.transpose(-2, -1)) * self.scale,
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    attn = torch.cat(
+                        [
+                            prompt_score_attn.expand(-1, -1, N, -1)
+                            * self.scale,  # (B, num_heads, N, num_prompt)
+                            (q @ k.transpose(-2, -1)) * self.scale,
+                        ],
+                        dim=-1,
+                    )
             else:
                 k = torch.cat((pk, k), dim=2)
                 attn = (
@@ -147,10 +190,15 @@ class Attention(nn.Module):
                 q @ k.transpose(-2, -1)
             ) * self.scale  # (B, num_heads, N, num_prompt + N)
 
-        if topk > 0 and prompt is not None and reduce_query:
+        if (
+            topk > 0
+            and prompt is not None
+            and reduce_query
+            and routing_mode != "soft_moe"
+        ):
             # Get topK among all MoE models
             _, num_heads, N, _ = attn.size()
-            eps_decay = eps_decay.unsqueeze(1)
+            eps_decay = eps_decay.dunsqueeze(1)
 
             with torch.no_grad():
                 prompt_score_max = prompt_score_.max(
@@ -366,6 +414,8 @@ class VisionTransformer(nn.Module):
             ]
         )
         self.norm = norm_layer(embed_dim)
+        self.last_prompt_scores = []
+        self.last_q_prompts = []
 
         trunc_normal_(self.pos_embed, std=0.02)
         trunc_normal_(self.cls_token, std=0.02)
@@ -383,6 +433,17 @@ class VisionTransformer(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
+
+    def _cache_prompt_scores(self, prompt_scores):
+        cached_scores = []
+        for prompt_score, prompt_aux in prompt_scores:
+            cached_scores.append(
+                (
+                    prompt_score.detach() if torch.is_tensor(prompt_score) else None,
+                    prompt_aux.detach() if torch.is_tensor(prompt_aux) else None,
+                )
+            )
+        self.last_prompt_scores = cached_scores
 
     def forward(
         self,
@@ -433,6 +494,11 @@ class VisionTransformer(nn.Module):
                 reduce_query=reduce_query,
             )
             prompt_scores.append(prompt_score)
+
+        self._cache_prompt_scores(prompt_scores)
+        self.last_q_prompts = [
+            getattr(blk.attn, "last_q_prompt", None) for blk in self.blocks
+        ]
 
         if return_attn:
             return prompt_scores

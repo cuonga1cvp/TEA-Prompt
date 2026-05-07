@@ -242,6 +242,335 @@ class VAPTPrompt(nn.Module):
                     setattr(self, f"old_e_pk_{e}_{l}_{h}", pk_h)
 
 
+class BaselineSMoPEPrompt(VAPTPrompt):
+    """
+    Baseline variant of VAPTPrompt:
+    - No top-K expert selection: all experts are active at all times (topk = -1)
+    - No router loss, no legacy loss: only CE loss is used
+    - Logs raw expert scores (query-key similarity) per layer/head to a JSONL file
+    """
+
+    def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768, num_heads=12):
+        super().__init__(emb_d, n_tasks, prompt_param, key_dim, num_heads)
+        # Disable top-K selection and all auxiliary losses
+        self.topk = -1
+        self.mu_router = 0.0
+        self.mu_router_old = 0.0
+        self.score_log_file = None
+
+    def set_score_log_file(self, path):
+        """Set the path of the JSONL file where expert scores will be appended."""
+        self.score_log_file = path
+
+    def router_loss(self, prompt_scores, task_id=-1, topk=-1):
+        """Returns 0 — no auxiliary loss of any kind."""
+        return 0.0
+
+    def log_scores(self, prompt_scores, task_id, batch_idx, epoch):
+        """
+        Append expert scores for every active layer and head to the log file.
+
+        prompt_scores: list indexed by block index i.
+            Each entry is (prompt_score_, prompt_score_label_) where
+            prompt_score_  shape: (B, num_heads, 1, num_experts)
+        One JSON line is written per (layer, head) combination.
+        """
+        if self.score_log_file is None:
+            return
+
+        import json
+
+        lines = []
+        for e in self.e_layers:
+            prompt_score, _ = prompt_scores[e]  # (B, num_heads, 1, num_experts)
+            if prompt_score is None:
+                continue
+            # Average over the batch dimension
+            avg_score = prompt_score.mean(dim=0).squeeze(1)  # (num_heads, num_experts)
+            for h in range(self.num_heads):
+                scores = avg_score[h].detach().cpu().tolist()
+                entry = {
+                    "task_id": task_id,
+                    "epoch": epoch,
+                    "batch": batch_idx,
+                    "layer": e,
+                    "head": h,
+                    "scores": scores,
+                }
+                lines.append(json.dumps(entry))
+
+        with open(self.score_log_file, "a") as f:
+            f.write("\n".join(lines) + "\n")
+
+
+class SoftMoEPrompt(VAPTPrompt):
+    """
+    Soft-MoE variant of VAPTPrompt.
+
+    prompt_param:
+    - arg 1: prompt length, equal to 2 * N_p
+    - arg 2: routing threshold rank (the default paper-style setup uses 5)
+    - arg 3: alpha_router
+    - arg 4: alpha_proto
+    - arg 5: epsilon
+    - arg 6: soft routing alpha
+    - arg 7: soft routing tau
+    """
+
+    def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768, num_heads=12):
+        super().__init__(emb_d, n_tasks, prompt_param, key_dim, num_heads)
+        self.route_rank = max(1, int(prompt_param[1]))
+        self.topk = -1
+        self.mu_router = float(prompt_param[2])
+        self.mu_proto = float(prompt_param[3])
+        self.mu_router_old = self.mu_proto
+        self.eps = float(prompt_param[4])
+        self.soft_alpha = float(prompt_param[5]) if len(prompt_param) > 5 else 1.0
+        self.soft_tau = float(prompt_param[6]) if len(prompt_param) > 6 else 1.0
+        self.mu_attention = float(prompt_param[7]) if len(prompt_param) > 7 else 0.0
+        self.last_loss_components = {
+            "router_loss": 0.0,
+            "proto_loss": 0.0,
+            "attention_loss": 0.0,
+            "prompt_loss": 0.0,
+        }
+
+        # Buffers to hold the mean reduced-query observed during the previous
+        # task — populated via `save_old_queries` after each task ends.
+        for e in self.e_layers:
+            for h in range(self.num_heads):
+                self.register_buffer(
+                    f"old_q_{e}_{h}",
+                    torch.zeros(1, self.head_dim),
+                )
+        self._has_old_queries = False
+
+    def save_old_queries(self, query_means):
+        """Store the mean reduced-query of the just-finished task.
+
+        query_means: dict mapping (layer_idx, head_idx) -> tensor of shape
+        (head_dim,) or (1, head_dim).
+        """
+        for e in self.e_layers:
+            for h in range(self.num_heads):
+                buf = getattr(self, f"old_q_{e}_{h}")
+                mean_q = query_means[(e, h)].detach().to(
+                    device=buf.device, dtype=buf.dtype
+                )
+                buf.copy_(mean_q.view(1, -1))
+        self._has_old_queries = True
+
+    def _score_threshold(self, scores):
+        kth = min(max(self.route_rank, 1), scores.size(-1))
+        return torch.topk(scores, kth, dim=-1).values[..., -1:]
+
+    def _routing_sigma(self, scores, threshold):
+        tau = max(self.soft_tau, self.eps)
+        scaled = torch.clamp(-(scores - threshold) / tau, min=-60.0, max=60.0)
+        return 1.0 / (
+            1.0
+            + self.soft_alpha
+            * torch.exp(scaled)
+        )
+
+    def router_loss(self, prompt_scores, task_id=-1, topk=-1):
+        device = next(self.parameters()).device
+        router_loss = torch.zeros((), device=device)
+        proto_loss = torch.zeros((), device=device)
+        attention_loss = torch.zeros((), device=device)
+
+        if self.mu_router > 0:
+            for e in self.e_layers:
+                prompt_score, _ = prompt_scores[e]
+                if prompt_score is None:
+                    continue
+
+                threshold = self._score_threshold(prompt_score)
+                sigma = self._routing_sigma(prompt_score, threshold)
+                selected = prompt_score > threshold
+
+                # Stable equivalent of:
+                # -(sum_{s_i > threshold} sigma(s_i) * exp(s_i)) / sum_j exp(s_j)
+                probs = torch.softmax(prompt_score, dim=-1)
+                routed_mass = (
+                    sigma * probs * selected.to(prompt_score.dtype)
+                ).sum(dim=-1)
+                router_loss = router_loss + (-routed_mass.mean() * self.mu_router)
+
+        if task_id > 0 and self.mu_proto > 0:
+            for e in self.e_layers:
+                for h in range(self.num_heads):
+                    current_pk_h = []
+                    old_pk_h = []
+                    sampled = []
+
+                    for l in range(self.num_experts):
+                        current_pk = getattr(self, f"e_pk_{e}_{l}_{h}")
+                        old_pk = getattr(self, f"old_e_pk_{e}_{l}_{h}")
+                        current_pk_h.append(current_pk)
+                        old_pk_h.append(old_pk)
+                        sampled.append(self.used_frequently[e][h][l])
+
+                    current_pk_h = torch.cat(current_pk_h, dim=0)
+                    old_pk_h = torch.cat(old_pk_h, dim=0)
+                    sampled = torch.tensor(
+                        sampled, device=current_pk_h.device, dtype=torch.bool
+                    )
+
+                    if not sampled.any():
+                        continue
+
+                    sampled_pk_h = old_pk_h[sampled]
+                    old_logits = sampled_pk_h @ old_pk_h.t()
+                    current_logits = sampled_pk_h @ current_pk_h.t()
+
+                    old_probs = torch.softmax(old_logits, dim=-1)
+                    current_probs = torch.softmax(current_logits, dim=-1)
+                    kth = min(max(self.route_rank, 1), old_probs.size(-1))
+                    indices = torch.topk(old_logits, kth, dim=-1).indices
+
+                    old_topk = torch.gather(old_probs, -1, indices)
+                    current_topk = torch.gather(current_probs, -1, indices)
+                    proto_loss = proto_loss + (
+                        old_topk
+                        * torch.log((old_topk + self.eps) / (current_topk + self.eps))
+                    ).sum() * self.mu_proto
+
+        if task_id > 0 and self.mu_attention > 0:
+            # Lazily detect old queries that were loaded from a checkpoint —
+            # the in-memory `_has_old_queries` flag is not persisted in state_dict,
+            # so a fresh process that just `load_state_dict`-ed has it False even
+            # though the buffers themselves are populated.
+            if not self._has_old_queries:
+                sample_q = getattr(self, f"old_q_{self.e_layers[0]}_0")
+                if sample_q.abs().sum().item() > 0:
+                    self._has_old_queries = True
+
+        if task_id > 0 and self.mu_attention > 0 and self._has_old_queries:
+            # Preserve key-value attention behavior of old prompts using the
+            # mean reduced-query observed during the previous task.
+            # For each expert l:
+            #   contrib_old[l]     = softmax(q_old @ pk_old.T)[l]     * pv_old[l]
+            #   contrib_current[l] = softmax(q_old @ pk_current.T)[l] * pv_current[l]
+            # The squared error per expert is weighted by sigma_old[l] — the
+            # sigmoid routing score under the old task — so only experts that
+            # were important for the old task contribute to the loss.
+            for e in self.e_layers:
+                for h in range(self.num_heads):
+                    current_pk_h = []
+                    current_pv_h = []
+                    old_pk_h = []
+                    old_pv_h = []
+
+                    for l in range(self.num_experts):
+                        current_pk_h.append(getattr(self, f"e_pk_{e}_{l}_{h}"))
+                        current_pv_h.append(getattr(self, f"e_pv_{e}_{l}_{h}"))
+                        old_pk_h.append(getattr(self, f"old_e_pk_{e}_{l}_{h}"))
+                        old_pv_h.append(getattr(self, f"old_e_pv_{e}_{l}_{h}"))
+
+                    current_pk_h = torch.cat(current_pk_h, dim=0)  # (E, D)
+                    current_pv_h = torch.cat(current_pv_h, dim=0)
+                    old_pk_h = torch.cat(old_pk_h, dim=0)
+                    old_pv_h = torch.cat(old_pv_h, dim=0)
+
+                    query_old = getattr(self, f"old_q_{e}_{h}")  # (1, D)
+
+                    scores_old = query_old @ old_pk_h.t()          # (1, E)
+                    scores_current = query_old @ current_pk_h.t()  # (1, E)
+
+                    threshold_old = self._score_threshold(scores_old)
+                    sigma_old = self._routing_sigma(scores_old, threshold_old)
+
+                    weights_old = torch.softmax(scores_old, dim=-1)          # (1, E)
+                    weights_current = torch.softmax(scores_current, dim=-1)  # (1, E)
+
+                    contrib_old = (
+                        weights_old.unsqueeze(-1) * old_pv_h.unsqueeze(0)
+                    )  # (1, E, D)
+                    contrib_current = (
+                        weights_current.unsqueeze(-1) * current_pv_h.unsqueeze(0)
+                    )  # (1, E, D)
+
+                    mse_per_expert = (
+                        (contrib_current - contrib_old) ** 2
+                    ).mean(dim=-1)  # (1, E)
+
+                    attention_loss = attention_loss + (
+                        sigma_old * mse_per_expert
+                    ).mean() * self.mu_attention
+
+        prompt_loss = router_loss + proto_loss + attention_loss
+        self.last_loss_components = {
+            "router_loss": float(router_loss.detach().cpu().item()),
+            "proto_loss": float(proto_loss.detach().cpu().item()),
+            "attention_loss": float(attention_loss.detach().cpu().item()),
+            "prompt_loss": float(prompt_loss.detach().cpu().item()),
+        }
+
+        return prompt_loss
+
+    def forward(self, x_querry, l, x_block, train=False, task_id=None, noise=False):
+        e_valid = False
+        loss = 0.0
+
+        if l in self.e_layers:
+            e_valid = True
+            B = x_block.shape[0]
+            pk = []
+            pv = []
+            for h in range(self.num_heads):
+                pk_h = []
+                pv_h = []
+                for i in range(self.num_experts):
+                    pk_h.append(getattr(self, f"e_pk_{l}_{i}_{h}"))
+                    pv_h.append(getattr(self, f"e_pv_{l}_{i}_{h}"))
+
+                pk.append(torch.cat(pk_h, dim=0).unsqueeze(0))
+                pv.append(torch.cat(pv_h, dim=0).unsqueeze(0))
+
+            pk = torch.cat(pk, dim=0)
+            pv = torch.cat(pv, dim=0)
+            Ek = pk.unsqueeze(0).expand(B, -1, -1, -1)
+            Ev = pv.unsqueeze(0).expand(B, -1, -1, -1)
+
+        if e_valid:
+            p_return = {
+                "pk": Ek,
+                "pv": Ev,
+                "routing_mode": "soft_moe",
+                "route_rank": self.route_rank,
+                "soft_alpha": self.soft_alpha,
+                "soft_tau": self.soft_tau,
+                "eps": self.eps,
+            }
+        else:
+            p_return = None
+
+        return p_return, loss, x_block
+
+    def update_prompt(self, prompt_scores):
+        for e in self.e_layers:
+            prompt_score, _ = prompt_scores[e]
+            if prompt_score is None:
+                continue
+
+            for h in range(self.num_heads):
+                weight = prompt_score[:, h, 0, :]
+                threshold = self._score_threshold(weight)
+                selected = weight > threshold
+                selected_indices = selected.nonzero(as_tuple=False)
+
+                if selected_indices.numel() == 0:
+                    continue
+
+                unique_vals, counts = torch.unique(
+                    selected_indices[:, 1], return_counts=True
+                )
+                for u, c in zip(unique_vals.tolist(), counts.tolist()):
+                    freq = getattr(self, f"e_freq_{e}_{u}_{h}")
+                    setattr(self, f"e_freq_{e}_{u}_{h}", freq + c)
+
+
 class VQPrompt(nn.Module):
     def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768):
         super().__init__()
@@ -773,6 +1102,14 @@ class ViTZoo(nn.Module):
             self.prompt = VAPTPrompt(
                 768, prompt_param[0], prompt_param[1], num_heads=12
             )
+        elif self.prompt_flag == "soft-moe":
+            self.prompt = SoftMoEPrompt(
+                768, prompt_param[0], prompt_param[1], num_heads=12
+            )
+        elif self.prompt_flag == "baseline_smope":
+            self.prompt = BaselineSMoPEPrompt(
+                768, prompt_param[0], prompt_param[1], num_heads=12
+            )
         else:
             self.prompt = None
 
@@ -794,12 +1131,14 @@ class ViTZoo(nn.Module):
         reduce_query = False
 
         if self.prompt is not None:  # if having a prompt module
-            if self.prompt_flag == "vapt":
+            if self.prompt_flag in ("vapt", "soft-moe", "baseline_smope"):
                 reduce_query = True
-                if dense:
+                if self.prompt_flag == "soft-moe":
+                    topk = -1
+                elif dense:
                     topk = -1
                 else:
-                    topk = self.prompt.topk
+                    topk = self.prompt.topk  # always -1 for baseline_smope
                 q = None
             else:
                 reduce_query = False

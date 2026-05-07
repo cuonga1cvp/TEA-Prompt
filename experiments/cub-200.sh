@@ -25,12 +25,25 @@ mkdir -p $OUTDIR
 #    arg 4 = alpha_proto
 #    arg 5 = epsilon
 
-python -u run.py --config configs/cub-200_prompt_vapt.yaml --gpuid $GPUID --repeat $REPEAT --overwrite $OVERWRITE \
-    --learner_type prompt --learner_name VAPTPrompt \
-    --prompt_param 50 5 1e-5 5e-5 0.4 --seeds 0 1 2 3 4 \
+python -u run.py --config configs/cub-200_prompt_vapt.yaml \
+    --gpuid 0 --repeat 1 --overwrite 1 \
+    --learner_type prompt --learner_name SoftMoEPrompt \
+    --prompt_param 50 5 1e-5 5e-5 1e-6 1.0 0.1 1e-4 --seeds 0 \
     --crct_epochs 50 --ca_batch_size_ratio 1 \
-    --pretrained_weigh sup21k \
-    --log_dir ${OUTDIR}/vapt-prompt
+    --pretrained_weight sup21k \
+    --log_dir outputs/CUB200/10-task/soft-moe-attn-50-5-1e-5-5e-5-1.0-0.1-1e-4 \
+    --adaptive_pred
+
+
+for mu in 0 10 1e-1 1e-2; do
+    python -u run.py --config configs/cub-200_prompt_vapt.yaml \
+        --gpuid 0 --repeat 1 --overwrite 1 \
+        --learner_type prompt --learner_name SoftMoEPrompt \
+        --prompt_param 50 5 1e-5 1e-5 1e-6 1.0 0.1 $mu --seeds 0 \
+        --crct_epochs 50 --ca_batch_size_ratio 1 \
+        --pretrained_weight sup21k \
+        --log_dir outputs/CUB200/10-task/soft-moe-attn-${mu} 
+done
 
 
 

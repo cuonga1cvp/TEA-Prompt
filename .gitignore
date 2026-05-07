@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Data & datasets (large, downloaded externally)
+data/
+datasets/
+
+# Pretrained model weights (large, downloaded externally)
+pretrained/*.bin
+pretrained/*.pth
+pretrained/*.npz
+
+# Training outputs / experiment results
+outputs/
+output/
+logs/
+*.log
+
+# Temporary
+*.tmp
+*.bak
