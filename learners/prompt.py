@@ -573,6 +573,7 @@ class SoftMoEPrompt(VAPTPrompt):
             "router_loss": loss_meters["router"].avg,
             "proto_loss": loss_meters["proto"].avg,
             "attention_loss": loss_meters["attention"].avg,
+            "attention_gaussian_loss": loss_meters["attention_gauss"].avg,
             "train_acc": acc_meter.avg,
         }
         with open(self.loss_log_file, "a") as f:
@@ -635,6 +636,9 @@ class SoftMoEPrompt(VAPTPrompt):
             "router_loss": float(prompt_components.get("router_loss", 0.0)),
             "proto_loss": float(prompt_components.get("proto_loss", 0.0)),
             "attention_loss": float(prompt_components.get("attention_loss", 0.0)),
+            "attention_gaussian_loss": float(
+                prompt_components.get("attention_gaussian_loss", 0.0)
+            ),
         }
 
         self.optimizer.zero_grad()
@@ -714,11 +718,18 @@ class SoftMoEPrompt(VAPTPrompt):
             }
             query_count = 0
 
+            # Per-class accumulators for attention_gaussian_loss.
+            # Keyed by (e, h, class_id).
+            class_q_sums = {}      # tensor (D,)
+            class_q_sq_sums = {}   # tensor (D,) — sum of squares for variance
+            class_q_counts = {}    # int
+
             num_samples = 0
             for i, (x, y, task) in enumerate(train_loader):
                 self.model.eval()
                 if self.gpu:
                     x = x.cuda()
+                    y = y.cuda()
                 with torch.no_grad():
                     prompt_scores = self.model(x, train=False, return_attn=True)
                 self.model.prompt.update_prompt(prompt_scores)
@@ -734,6 +745,29 @@ class SoftMoEPrompt(VAPTPrompt):
                         query_sums[(e, h)] += q[:, h, 0, :].sum(dim=0)
                 query_count += x.size(0)
 
+                # Per-class accumulation for attention_gaussian_loss
+                unique_classes = torch.unique(y)
+                for c_t in unique_classes:
+                    c = int(c_t.item())
+                    mask = (y == c_t)
+                    n_c = int(mask.sum().item())
+                    if n_c == 0:
+                        continue
+                    for e in e_layers:
+                        if e >= len(q_prompts) or q_prompts[e] is None:
+                            continue
+                        q = q_prompts[e]   # (B, H, 1, D)
+                        for h in range(num_heads):
+                            qch = q[mask, h, 0, :]   # (n_c, D)
+                            key = (e, h, c)
+                            if key not in class_q_sums:
+                                class_q_sums[key] = torch.zeros(head_dim, device=device)
+                                class_q_sq_sums[key] = torch.zeros(head_dim, device=device)
+                                class_q_counts[key] = 0
+                            class_q_sums[key] += qch.sum(dim=0)
+                            class_q_sq_sums[key] += (qch ** 2).sum(dim=0)
+                            class_q_counts[key] += n_c
+
             self.model.prompt.update_num_samples(num_samples)
 
             if query_count > 0:
@@ -741,6 +775,20 @@ class SoftMoEPrompt(VAPTPrompt):
                     k: v / query_count for k, v in query_sums.items()
                 }
                 prompt_module.save_old_queries(query_means)
+
+            if class_q_counts:
+                class_means = {}
+                class_vars = {}
+                for key, count in class_q_counts.items():
+                    if count <= 0:
+                        continue
+                    mean = class_q_sums[key] / count
+                    sq_mean = class_q_sq_sums[key] / count
+                    var = (sq_mean - mean ** 2).clamp(min=1e-6)
+                    class_means[key] = mean
+                    class_vars[key] = var
+                if class_means:
+                    prompt_module.save_old_queries_per_class(class_means, class_vars)
 
             self._save_snapshot(task_id)
             print("-" * 10)
@@ -783,6 +831,7 @@ class SoftMoEPrompt(VAPTPrompt):
                     "router": AverageMeter(),
                     "proto": AverageMeter(),
                     "attention": AverageMeter(),
+                    "attention_gauss": AverageMeter(),
                 }
                 acc = AverageMeter()
                 batch_timer.tic()
@@ -813,6 +862,9 @@ class SoftMoEPrompt(VAPTPrompt):
                     losses["router"].update(loss_components["router_loss"], y.size(0))
                     losses["proto"].update(loss_components["proto_loss"], y.size(0))
                     losses["attention"].update(loss_components["attention_loss"], y.size(0))
+                    losses["attention_gauss"].update(
+                        loss_components["attention_gaussian_loss"], y.size(0)
+                    )
                     batch_timer.tic()
 
                 self._log_epoch_losses(task_id, epoch, phase, phase_epoch, losses, acc)
@@ -823,12 +875,13 @@ class SoftMoEPrompt(VAPTPrompt):
                     end=" ",
                 )
                 self.log(
-                    " * Total {total.avg:.3f} | CE {ce.avg:.3f} | Router {router.avg:.3f} | Proto {proto.avg:.3f} | Attn {attention.avg:.3f} | Train Acc {acc.avg:.3f}".format(
+                    " * Total {total.avg:.3f} | CE {ce.avg:.3f} | Router {router.avg:.3f} | Proto {proto.avg:.3f} | Attn {attention.avg:.3f} | AttnG {attn_g.avg:.3f} | Train Acc {acc.avg:.3f}".format(
                         total=losses["total"],
                         ce=losses["ce"],
                         router=losses["router"],
                         proto=losses["proto"],
                         attention=losses["attention"],
+                        attn_g=losses["attention_gauss"],
                         acc=acc,
                     )
                 )
@@ -845,6 +898,7 @@ class SoftMoEPrompt(VAPTPrompt):
                     "router": AverageMeter(),
                     "proto": AverageMeter(),
                     "attention": AverageMeter(),
+                    "attention_gauss": AverageMeter(),
                 }
                 acc = AverageMeter()
                 batch_timer.tic()
@@ -874,6 +928,9 @@ class SoftMoEPrompt(VAPTPrompt):
                     losses["router"].update(loss_components["router_loss"], y.size(0))
                     losses["proto"].update(loss_components["proto_loss"], y.size(0))
                     losses["attention"].update(loss_components["attention_loss"], y.size(0))
+                    losses["attention_gauss"].update(
+                        loss_components["attention_gaussian_loss"], y.size(0)
+                    )
                     batch_timer.tic()
 
                 self._log_epoch_losses(task_id, epoch, phase, phase_epoch, losses, acc)
@@ -883,12 +940,13 @@ class SoftMoEPrompt(VAPTPrompt):
                     )
                 )
                 self.log(
-                    " * Total {total.avg:.3f} | CE {ce.avg:.3f} | Router {router.avg:.3f} | Proto {proto.avg:.3f} | Attn {attention.avg:.3f} | Train Acc {acc.avg:.3f}".format(
+                    " * Total {total.avg:.3f} | CE {ce.avg:.3f} | Router {router.avg:.3f} | Proto {proto.avg:.3f} | Attn {attention.avg:.3f} | AttnG {attn_g.avg:.3f} | Train Acc {acc.avg:.3f}".format(
                         total=losses["total"],
                         ce=losses["ce"],
                         router=losses["router"],
                         proto=losses["proto"],
                         attention=losses["attention"],
+                        attn_g=losses["attention_gauss"],
                         acc=acc,
                     )
                 )

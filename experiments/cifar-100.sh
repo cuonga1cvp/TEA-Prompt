@@ -23,13 +23,24 @@ mkdir -p $OUTDIR
 # arg5: epsilon
 # arg6: sigma alpha
 # arg7: sigma tau
-python -u run.py --config configs/cifar-100_prompt_vapt.yaml \
-    --gpuid 0 --repeat 1 --overwrite 1 \
-    --learner_type prompt --learner_name SoftMoEPrompt \
-    --prompt_param 50 5 1e-5 1e-5 1e-6 1.0 0.1 1e-4 --seeds 0 \
-    --crct_epochs 50 --ca_batch_size_ratio 1 \
-    --log_dir outputs/CIFAR100/10-task/soft-moe-attn_50_5_1e-5_1e-5_1.0_0.1_1e-4 \
-    --adaptive_pred
+# python -u run.py --config configs/cifar-100_prompt_vapt.yaml \
+#     --gpuid 0 --repeat 1 --overwrite 1 \
+#     --learner_type prompt --learner_name SoftMoEPrompt \
+#     --prompt_param 50 5 1e-5 1e-5 1e-6 1.0 0.1 1e-4 --seeds 0 \
+#     --crct_epochs 50 --ca_batch_size_ratio 1 \
+#     --log_dir outputs/CIFAR100/10-task/soft-moe-attn_50_5_1e-5_1e-5_1.0_0.1_1e-4 \
+#     --adaptive_pred
+
+for mu in 10; do
+    python -u run.py --config configs/cifar-100_prompt_vapt.yaml \
+        --gpuid 0 --repeat 1 --overwrite 1 \
+        --learner_type prompt --learner_name SoftMoEPrompt \
+        --prompt_param 50 5 0 0 1e-6 1.0 0.2 0 $mu 8 --seeds 0 \
+        --crct_epochs 50 --ca_batch_size_ratio 1 \
+        --pretrained_weight sup21k \
+        --log_dir outputs/CIFAR100/10-task/soft-moe-attn-sqrt_0_0_0${mu} \
+        --adaptive_pred 
+done
 
 
 # SMoPE

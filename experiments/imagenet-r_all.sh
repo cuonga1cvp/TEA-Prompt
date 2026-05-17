@@ -81,3 +81,15 @@ sleep 10
 #         --learner_type prompt --learner_name VQPrompt \
 #         --prompt_param 10 8 1 --seeds 0 1 2 3 4\
 #         --log_dir ${OUTDIR_L}/vq-prompt 
+
+#softmope
+
+for mu in 1 10 50 100; do
+    python -u run.py --config configs/imnet-r_prompt_vapt.yaml \
+        --gpuid 0 --repeat 1 --overwrite 1 \
+        --learner_type prompt --learner_name SoftMoEPrompt \
+        --prompt_param 50 5 0 0 1e-6 1.0 0.2 0 $mu 8 --seeds 0 \
+        --crct_epochs 50 --ca_batch_size_ratio 1 \
+        --pretrained_weight sup21k \
+        --log_dir outputs/ImageNet_R/10-task/soft-moe-attn_0_0_0${mu}_8 
+done

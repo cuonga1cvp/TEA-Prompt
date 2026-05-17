@@ -317,7 +317,8 @@ class SoftMoEPrompt(VAPTPrompt):
     - arg 7: soft routing tau
     """
 
-    def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768, num_heads=12):
+    def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768, num_heads=12,
+                 num_classes=100):
         super().__init__(emb_d, n_tasks, prompt_param, key_dim, num_heads)
         self.route_rank = max(1, int(prompt_param[1]))
         self.topk = -1
@@ -328,10 +329,19 @@ class SoftMoEPrompt(VAPTPrompt):
         self.soft_alpha = float(prompt_param[5]) if len(prompt_param) > 5 else 1.0
         self.soft_tau = float(prompt_param[6]) if len(prompt_param) > 6 else 1.0
         self.mu_attention = float(prompt_param[7]) if len(prompt_param) > 7 else 0.0
+        self.mu_attention_gaussian = (
+            float(prompt_param[8]) if len(prompt_param) > 8 else 0.0
+        )
+        # K = number of query samples drawn from the per-class Gaussian per (e, h)
+        self.K_attn_gauss = (
+            int(prompt_param[9]) if len(prompt_param) > 9 else 4
+        )
+        self.num_classes_total = int(num_classes)
         self.last_loss_components = {
             "router_loss": 0.0,
             "proto_loss": 0.0,
             "attention_loss": 0.0,
+            "attention_gaussian_loss": 0.0,
             "prompt_loss": 0.0,
         }
 
@@ -344,6 +354,25 @@ class SoftMoEPrompt(VAPTPrompt):
                     torch.zeros(1, self.head_dim),
                 )
         self._has_old_queries = False
+
+        # Class-conditional Gaussian over reduced-queries per (layer, head, class).
+        # Shape: (num_layers_inject, num_heads, num_classes_total, head_dim).
+        # Variance defaults to 1 to keep stds well-defined before the first save.
+        n_layers = len(self.e_layers)
+        self.register_buffer(
+            "old_q_class_mean",
+            torch.zeros(n_layers, num_heads, self.num_classes_total, self.head_dim),
+        )
+        self.register_buffer(
+            "old_q_class_var",
+            torch.ones(n_layers, num_heads, self.num_classes_total, self.head_dim),
+        )
+        # Boolean mask: which classes have valid stats so far.
+        self.register_buffer(
+            "old_q_class_seen",
+            torch.zeros(self.num_classes_total, dtype=torch.bool),
+        )
+        self._has_class_old_queries = False
 
     def save_old_queries(self, query_means):
         """Store the mean reduced-query of the just-finished task.
@@ -359,6 +388,33 @@ class SoftMoEPrompt(VAPTPrompt):
                 )
                 buf.copy_(mean_q.view(1, -1))
         self._has_old_queries = True
+
+    def save_old_queries_per_class(self, class_means, class_vars):
+        """Update per-class Gaussian stats for the classes seen this task.
+
+        class_means: dict mapping (e, h, c) -> tensor (head_dim,)
+        class_vars : dict mapping (e, h, c) -> tensor (head_dim,)  (diagonal)
+
+        Old classes from previous tasks are preserved; only the new keys overwrite.
+        """
+        mean_buf = self.old_q_class_mean   # (L, H, C, D)
+        var_buf = self.old_q_class_var
+        seen = self.old_q_class_seen
+        seen_classes = set()
+        for (e, h, c), m in class_means.items():
+            li = self.e_layers.index(e)
+            mean_buf[li, h, c].copy_(
+                m.detach().to(device=mean_buf.device, dtype=mean_buf.dtype)
+            )
+            seen_classes.add(int(c))
+        for (e, h, c), v in class_vars.items():
+            li = self.e_layers.index(e)
+            var_buf[li, h, c].copy_(
+                v.detach().to(device=var_buf.device, dtype=var_buf.dtype)
+            )
+        for c in seen_classes:
+            seen[c] = True
+        self._has_class_old_queries = True
 
     def _score_threshold(self, scores):
         kth = min(max(self.route_rank, 1), scores.size(-1))
@@ -378,6 +434,8 @@ class SoftMoEPrompt(VAPTPrompt):
         router_loss = torch.zeros((), device=device)
         proto_loss = torch.zeros((), device=device)
         attention_loss = torch.zeros((), device=device)
+        attention_gaussian_loss = torch.zeros((), device=device)
+        attn_scale = self.head_dim ** -0.5
 
         if self.mu_router > 0:
             for e in self.e_layers:
@@ -450,8 +508,8 @@ class SoftMoEPrompt(VAPTPrompt):
             # Preserve key-value attention behavior of old prompts using the
             # mean reduced-query observed during the previous task.
             # For each expert l:
-            #   contrib_old[l]     = softmax(q_old @ pk_old.T)[l]     * pv_old[l]
-            #   contrib_current[l] = softmax(q_old @ pk_current.T)[l] * pv_current[l]
+            #   contrib_old[l]     = softmax((q_old @ pk_old.T) * scale)[l]     * pv_old[l]
+            #   contrib_current[l] = softmax((q_old @ pk_current.T) * scale)[l] * pv_current[l]
             # The squared error per expert is weighted by sigma_old[l] — the
             # sigmoid routing score under the old task — so only experts that
             # were important for the old task contribute to the loss.
@@ -475,8 +533,8 @@ class SoftMoEPrompt(VAPTPrompt):
 
                     query_old = getattr(self, f"old_q_{e}_{h}")  # (1, D)
 
-                    scores_old = query_old @ old_pk_h.t()          # (1, E)
-                    scores_current = query_old @ current_pk_h.t()  # (1, E)
+                    scores_old = (query_old @ old_pk_h.t()) * attn_scale
+                    scores_current = (query_old @ current_pk_h.t()) * attn_scale
 
                     threshold_old = self._score_threshold(scores_old)
                     sigma_old = self._routing_sigma(scores_old, threshold_old)
@@ -499,11 +557,86 @@ class SoftMoEPrompt(VAPTPrompt):
                         sigma_old * mse_per_expert
                     ).mean() * self.mu_attention
 
-        prompt_loss = router_loss + proto_loss + attention_loss
+        if task_id > 0 and self.mu_attention_gaussian > 0:
+            # Lazily detect class-conditional Gaussians loaded from a checkpoint
+            # (the in-memory _has_class_old_queries flag is not persisted).
+            if not self._has_class_old_queries and bool(self.old_q_class_seen.any()):
+                self._has_class_old_queries = True
+
+        if (
+            task_id > 0
+            and self.mu_attention_gaussian > 0
+            and self._has_class_old_queries
+        ):
+            # Sample K queries per (layer, head) from the Gaussian of every
+            # already-seen class, then apply the same per-expert MSE × sigma_old
+            # gating used by `attention_loss` — but with class-aware queries
+            # instead of one task-mean query.
+            seen_idx = torch.nonzero(self.old_q_class_seen, as_tuple=False).squeeze(-1)
+            if seen_idx.numel() > 0:
+                K = max(1, int(self.K_attn_gauss))
+                C = seen_idx.numel()
+
+                for e in self.e_layers:
+                    li = self.e_layers.index(e)
+                    for h in range(self.num_heads):
+                        current_pk_h = []
+                        current_pv_h = []
+                        old_pk_h = []
+                        old_pv_h = []
+                        for l in range(self.num_experts):
+                            current_pk_h.append(getattr(self, f"e_pk_{e}_{l}_{h}"))
+                            current_pv_h.append(getattr(self, f"e_pv_{e}_{l}_{h}"))
+                            old_pk_h.append(getattr(self, f"old_e_pk_{e}_{l}_{h}"))
+                            old_pv_h.append(getattr(self, f"old_e_pv_{e}_{l}_{h}"))
+                        current_pk_h = torch.cat(current_pk_h, dim=0)  # (E, D)
+                        current_pv_h = torch.cat(current_pv_h, dim=0)
+                        old_pk_h = torch.cat(old_pk_h, dim=0)
+                        old_pv_h = torch.cat(old_pv_h, dim=0)
+
+                        means = self.old_q_class_mean[li, h, seen_idx]   # (C, D)
+                        vars_ = self.old_q_class_var[li, h, seen_idx]    # (C, D)
+                        stds = (vars_ + self.eps).clamp(min=self.eps).sqrt()
+
+                        # Reparameterized samples: (C, K, D) → (C*K, D)
+                        noise = torch.randn(C, K, means.size(-1), device=means.device)
+                        queries = means.unsqueeze(1) + stds.unsqueeze(1) * noise
+                        queries = queries.reshape(-1, means.size(-1))
+
+                        scores_old = (queries @ old_pk_h.t()) * attn_scale
+                        scores_current = (queries @ current_pk_h.t()) * attn_scale
+
+                        threshold_old = self._score_threshold(scores_old)
+                        sigma_old = self._routing_sigma(scores_old, threshold_old)
+
+                        w_old = torch.softmax(scores_old, dim=-1)
+                        w_current = torch.softmax(scores_current, dim=-1)
+
+                        contrib_old = (
+                            w_old.unsqueeze(-1) * old_pv_h.unsqueeze(0)
+                        )  # (C*K, E, D)
+                        contrib_current = (
+                            w_current.unsqueeze(-1) * current_pv_h.unsqueeze(0)
+                        )
+
+                        mse_per_expert = (
+                            (contrib_current - contrib_old) ** 2
+                        ).mean(dim=-1)  # (C*K, E)
+
+                        attention_gaussian_loss = attention_gaussian_loss + (
+                            sigma_old * mse_per_expert
+                        ).mean() * self.mu_attention_gaussian
+
+        prompt_loss = (
+            router_loss + proto_loss + attention_loss + attention_gaussian_loss
+        )
         self.last_loss_components = {
             "router_loss": float(router_loss.detach().cpu().item()),
             "proto_loss": float(proto_loss.detach().cpu().item()),
             "attention_loss": float(attention_loss.detach().cpu().item()),
+            "attention_gaussian_loss": float(
+                attention_gaussian_loss.detach().cpu().item()
+            ),
             "prompt_loss": float(prompt_loss.detach().cpu().item()),
         }
 
@@ -1104,7 +1237,8 @@ class ViTZoo(nn.Module):
             )
         elif self.prompt_flag == "soft-moe":
             self.prompt = SoftMoEPrompt(
-                768, prompt_param[0], prompt_param[1], num_heads=12
+                768, prompt_param[0], prompt_param[1], num_heads=12,
+                num_classes=num_classes,
             )
         elif self.prompt_flag == "baseline_smope":
             self.prompt = BaselineSMoPEPrompt(
