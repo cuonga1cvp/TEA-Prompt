@@ -1,8 +1,3 @@
-# One-Prompt Strikes Back: Sparse Mixture of Experts for Prompt-based Continual Learning
-
-Official PyTorch code for *"One-Prompt Strikes Back: Sparse Mixture of Experts for Prompt-based Continual Learning"*, with an additional **Attention Preservation Loss** for stronger anti-forgetting on the SoftMoE prompt module.
-
----
 
 ## Requirements
 
@@ -59,8 +54,6 @@ Run the following under the project root. Scripts are set up for **1 GPU**.
 
 ```bash
 bash experiments/cifar-100.sh
-bash experiments/cub-200.sh
-bash experiments/imagenet-r_all.sh
 ```
 
 Results are saved under `outputs/` (also gitignored).
